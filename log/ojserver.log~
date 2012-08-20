@@ -1,3 +1,0 @@
-2012-08-06 18:43:48 [NOTICE] OPEN logfile ../log/ojserver.log sucess.
-2012-08-06 18:43:48 [NOTICE] Server init success.
-2012-08-06 18:43:48 [FATAL][server.cpp:920] Bind Error: Address already in use
