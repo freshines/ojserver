@@ -1,0 +1,923 @@
+/*
+ * server.cpp
+ *
+ *  Created on: Aug 4, 2012
+ *      Author: freshines
+ */
+
+#include "server.h"
+#include "task_queue.h"
+
+char MYSQL_HOST[50]={0};
+char MYSQL_USER[50]={0};
+char MYSQL_PASSWORD[50]={0};
+char MYSQL_DB[50]={0};
+char REJUDGE_CONN_STR[100]={0};
+char SUBMIT_STR[100]={0};
+char REJUDGE_STR[100]={0};
+char ERROR_REJUDGE_STR[100]={0};
+char CHALLENGE_STR[100]={0};
+char PRETEST_STR[100]={0};
+char TEST_ALL_STR[100]={0};
+int LISTEN_PORT;
+int MYSQL_port;
+
+struct ARG {
+    int num;
+    int fd;
+};
+
+void writeLog(const char *templog)
+{
+	time_t CurTime;
+	struct tm TmTime;
+	time(&CurTime);
+	localtime_r(&CurTime, &TmTime);
+    printf("%4d-%02d-%02d %02d:%02d:%02d %s\n", TmTime.tm_year+1900, TmTime.tm_mon+1, TmTime.tm_mday, TmTime.tm_hour, TmTime.tm_min, TmTime.tm_sec, templog);
+}
+
+
+bool thread_busy[MAX_JUDGER_NUMBER];
+bool used[MAX_JUDGER_NUMBER];
+string jvname[MAX_JUDGER_NUMBER];
+int temp_num;
+int queuesize;
+pthread_mutex_t mutex_link=PTHREAD_MUTEX_INITIALIZER;
+
+
+void result_dealer(char filename[200],int temp_pid,int temp_runid,int temp_cid,char temp_username[])
+{
+    MYSQL * mysql;
+    MYSQL_RES *res;
+    MYSQL_ROW row;
+    mysql=(MYSQL *)malloc(sizeof(MYSQL));
+    mysql_init(mysql);
+    if (!mysql_real_connect(mysql,NULL,MYSQL_USER,MYSQL_PASSWORD,MYSQL_DB,MYSQL_PORT,NULL,0)) {
+        perror("cannot connect mysql!\n");
+        exit(1);
+    }
+    mysql_query(mysql,"set names utf8");
+    FILE *target_file=fopen(filename,"r");
+    int type,ri,mu,tu;
+    char resu[100]={0};
+    char ts[10][50];
+    fscanf(target_file,"%s %d\n%s %d\n%s %d\n%s %d\n%s ",ts[0],&type,ts[1],&ri,ts[2],&mu,ts[3],&tu,ts[4]);
+    fgets(resu,100,target_file);
+    char update[200]={0};
+    sprintf(update,"SELECT username,contest_belong,pid FROM status WHERE runid=%d",ri);
+    mysql_query(mysql,update);
+    res=mysql_use_result(mysql);
+    row=mysql_fetch_row(res);
+    temp_runid=ri;
+    strcpy(temp_username,row[0]);
+    temp_cid=atoi(row[1]);
+    temp_pid=atoi(row[2]);
+    mysql_free_result(res);
+    resu[strlen(resu)-1]=0;
+    sprintf(update,"UPDATE status set result='%s', memory_used=%d, time_used=%d WHERE runid=%d",resu,mu,tu,ri);
+    mysql_query(mysql,update);
+    if (strcmp(resu,"Accepted")==0) {
+        sprintf(update,"SELECT count(*) FROM status WHERE username='%s' AND pid='%d' AND result='Accepted'",temp_username,temp_pid);
+        mysql_query(mysql,update);
+        res=mysql_use_result(mysql);
+        row=mysql_fetch_row(res);
+        if (atoi(row[0])==1) {
+            mysql_free_result(res);
+            sprintf(update,"UPDATE user set total_ac=total_ac+1 WHERE username='%s'",temp_username);
+            mysql_query(mysql,update);
+            res=mysql_use_result(mysql);
+        }
+        mysql_free_result(res);
+        sprintf(update,"UPDATE problem set total_ac=total_ac+1 WHERE pid=%d",temp_pid);
+    }
+    else if (strcmp(resu,"Wrong Answer")==0) {
+        sprintf(update,"UPDATE problem set total_wa=total_wa+1 WHERE pid=%d",temp_pid);
+    }
+    else if (strcmp(resu,"Runtime Error")==0) {
+        sprintf(update,"UPDATE problem set total_re=total_re+1 WHERE pid=%d",temp_pid);
+    }
+    else if (strcmp(resu,"Presentation Error")==0) {
+        sprintf(update,"UPDATE problem set total_pe=total_pe+1 WHERE pid=%d",temp_pid);
+    }
+    else if (strcmp(resu,"Time Limit Exceed")==0) {
+        sprintf(update,"UPDATE problem set total_tle=total_tle+1 WHERE pid=%d",temp_pid);
+    }
+    else if (strcmp(resu,"Memory Limit Exceed")==0) {
+        sprintf(update,"UPDATE problem set total_mle=total_mle+1 WHERE pid=%d",temp_pid);
+    }
+    else if (strcmp(resu,"Output Limit Exceed")==0) {
+        sprintf(update,"UPDATE problem set total_ole=total_ole+1 WHERE pid=%d",temp_pid);
+    }
+    else if (strcmp(resu,"Restricted Function")==0) {
+        sprintf(update,"UPDATE problem set total_rf=total_rf+1 WHERE pid=%d",temp_pid);
+    }
+    else if (strcmp(resu,"Compile Error")==0) {
+        sprintf(update,"UPDATE problem set total_ce=total_ce+1 WHERE pid=%d",temp_pid);
+    }
+    mysql_query(mysql,update);
+    char tempce[50000]={0};
+    char ce_info_data[MAX_DATA_SIZE]={0};
+    char ceupdate[MAX_DATA_SIZE]={0};
+    while (strcmp(tempce,"__COMPILE-INFO-BEGIN-LABLE__")!=0&&strcmp(tempce,"__COMPILE-INFO-BEGIN-LABLE__\n")!=0&&strcmp(tempce,"__COMPILE-INFO-BEGIN-LABLE__\r\n")!=0) fgets(tempce,50000,target_file);
+    while (1) {
+        fgets(tempce,50000,target_file);
+        if (strcmp(tempce,"__COMPILE-INFO-END-LABLE__")==0||strcmp(tempce,"__COMPILE-INFO-END-LABLE__\n")==0||strcmp(tempce,"__COMPILE-INFO-END-LABLE__\r\n")==0) break;
+        strcat(ce_info_data,tempce);
+    }
+    std::string str1;
+    str1=ce_info_data;
+    int lastpos=0;
+
+    while (str1.find("\"",lastpos,1)!=std::string::npos) {
+        lastpos=str1.find("\"",lastpos,1);
+        str1.replace(lastpos,1,"\\\"");
+        lastpos+=2;
+    }
+    strcpy(ce_info_data,str1.c_str());
+    sprintf(ceupdate,"UPDATE status set ce_info=\"%s\" WHERE runid=%d",ce_info_data,ri);
+    mysql_query(mysql,ceupdate);
+    char templog[200]={0};
+    sprintf(templog,"Received a result, user: %s, runid: %d result:%s",temp_username,temp_runid,resu);
+    NOTICE(templog);
+    fclose(target_file);
+    mysql_close(mysql);
+    free(mysql);
+}
+
+bool dealneed_judge(ARG * arg, task_t &task)
+{
+    MYSQL_RES *res;
+    MYSQL_ROW row;
+    MYSQL * mysql;
+    char buffer[MAX_DATA_SIZE]={0};
+    int tnum=arg->num;
+    int tfd=arg->fd;
+
+    char templog[20000]={0};
+
+    sprintf(templog,"Run fetched to no.%d",tnum);
+    NOTICE(templog);
+    mysql=(MYSQL *)malloc(sizeof(MYSQL));
+    mysql_init(mysql);
+    if (!mysql_real_connect(mysql,NULL,MYSQL_USER,MYSQL_PASSWORD,MYSQL_DB,MYSQL_PORT,NULL,0)) {
+        FATAL("%s", mysql_error(mysql));
+        exit(1);
+    }
+    mysql_query(mysql,"set names utf8");
+    queuesize--;
+    char query[200]={0};
+    sprintf(query,"SELECT status.source,status.runid,status.language,status.pid,problem.ignore_noc FROM status,problem WHERE status.pid=problem.pid and runid=%d", task.get_runid());
+    //writelog(query);writelog("\n");
+    int temp_t=mysql_real_query(mysql,query,strlen(query));
+    if (temp_t) {
+    	FATAL("%s", mysql_error(mysql));
+        exit(1);
+    }
+    res=mysql_use_result(mysql);
+    row=mysql_fetch_row(res);
+    if (task.get_type()==NEED_JUDGE&&strcmp(row[4],"1")==0)
+    	task.set_type(DO_TESTALL);
+    char filename[200]={0};
+    sprintf(filename,"raw_files/%d.bott",task.get_runid());
+    NOTICE("FILENAME: %s", filename);
+    FILE* datafile=fopen(filename,"w");
+    if (datafile==NULL) {
+    	char tmp[100];
+        sprintf(tmp,"CANNOT OPEN FILE %s!!!",filename);
+        WARNING(tmp);
+    }
+    fprintf(datafile,"<type> %d\n", task.get_type());
+    fprintf(datafile,"__SOURCE-CODE-BEGIN-LABLE__\n");
+    fprintf(datafile,"%s\n",row[0]);
+    fprintf(datafile,"__SOURCE-CODE-END-LABLE__\n");
+    fprintf(datafile,"<runid> %s\n<language> %s\n<pid> %s\n",row[1],row[2],row[3]);
+    int temp_pid=atoi(row[3]);
+    mysql_free_result(res);
+    sprintf(query,"SELECT number_of_testcase,time_limit,case_time_limit,memory_limit,special_judge_status,vname,vid FROM problem WHERE pid=%d",temp_pid);
+    temp_t=mysql_real_query(mysql,query,strlen(query));
+    if (temp_t) {
+    	FATAL("%s", mysql_error(mysql));
+        exit(1);
+    }
+    res=mysql_use_result(mysql);
+    row=mysql_fetch_row(res);
+    fprintf(datafile,"<testcases> %s\n<time_limit> %s\n<case_limit> %s\n<memory_limit> %s\n<special> %s\n<vname> %s\n<vid> %s\n",row[0],row[1],row[2],row[3],row[4],row[5],row[6]);
+    mysql_free_result(res);
+    sprintf(query,"UPDATE status set result='Judging' WHERE runid=%d", task.get_runid());
+    mysql_real_query(mysql,query,strlen(query));
+    fclose(datafile);
+    int source=open(filename,O_RDONLY);
+    while((temp_t=read(source,buffer,sizeof(buffer)))>0)
+        write(tfd,buffer,temp_t);
+    close(source);
+    sprintf(filename,"results/%dres.bott", task.get_runid());
+    NOTICE("filename: %s", filename);
+    FILE *target_file=fopen(filename,"w");
+    bool got_things=false;
+    memset(buffer,0,sizeof(buffer));
+    while (!got_things)
+    {
+        while ((temp_t=recv(tfd,buffer,MAX_DATA_SIZE,MSG_DONTWAIT))>0)
+        {
+            got_things=true;
+            fputs(buffer,target_file);
+        }
+        if (temp_t==0)
+        {
+            fclose(target_file);
+            char templog[200]={0};
+            sprintf(templog,"Lost connection with judger %d.",tnum);
+            used[tnum] = false;
+            WARNING(templog);
+            sprintf(templog,"Runid: %d requeued.",task.get_runid());
+            NOTICE(templog);
+            sprintf(query,"UPDATE status set result='Judge Error & Requeued' WHERE runid=%d", task.get_runid());
+            mysql_real_query(mysql,query,strlen(query));
+
+            pthread_mutex_lock(&task_queue::instance().task_list_lock);
+            task_queue::instance().push_back_task(task);
+            pthread_cond_signal(&task_queue::instance().task_cond_lock);
+            pthread_mutex_unlock(&task_queue::instance().task_list_lock);
+
+            mysql_close(mysql);
+            free(mysql);
+            return true;
+        }
+        else
+        	used[tnum] = true;
+        usleep(5000);
+        if (buffer[0]!='<')
+        	got_things=false;
+    }
+    used[tnum] = true;
+    fclose(target_file);
+    int temp_runid;
+    char temp1[50],temp2[50],temp3[50];
+    sscanf(buffer,"%s%s%s%d",temp1,temp2,temp3,&temp_runid);
+    sprintf(filename,"results/%dres.bott",temp_runid);
+    target_file=fopen(filename,"w");
+    fputs(buffer,target_file);
+    while (recv(tfd,buffer,MAX_DATA_SIZE,MSG_DONTWAIT)>0)
+        fputs(buffer,target_file);
+    fclose(target_file);
+    sprintf(query,"SELECT pid,contest_belong,username FROM status WHERE runid=%d", task.get_runid());
+    temp_t=mysql_real_query(mysql,query,strlen(query));
+    if (temp_t) {
+    	FATAL("%s", mysql_error(mysql));
+        exit(1);
+    }
+    res=mysql_use_result(mysql);
+    row=mysql_fetch_row(res);
+    temp_pid=atoi(row[0]);
+    int temp_cid=atoi(row[1]);
+    char temp_username[256]={0};
+    strcpy(temp_username,row[2]);
+    mysql_free_result(res);
+    result_dealer(filename,temp_pid, task.get_runid(),temp_cid,temp_username);
+//    dorunid[tnum].runid=-1;
+    thread_busy[tnum]=false;
+    sprintf(templog,"task %d Run Finished", task.get_runid());
+//    printf("Judge %d Run Finished\n",tnum);
+    NOTICE(templog);
+    mysql_close(mysql);
+    free(mysql);
+
+    return true;
+}
+
+void cha_result_dealer(char filename[200],int temp_chaid)
+{
+    MYSQL * mysql;
+    mysql=(MYSQL *)malloc(sizeof(MYSQL));
+    mysql_init(mysql);
+    if (!mysql_real_connect(mysql,NULL,MYSQL_USER,MYSQL_PASSWORD,MYSQL_DB,MYSQL_PORT,NULL,0)) {
+    	FATAL("%s", mysql_error(mysql));
+        exit(1);
+    }
+    mysql_query(mysql,"set names utf8");
+    FILE *target_file=fopen(filename,"r");
+    int type,ci;
+    char resu[200]={0};
+    char ts[10][50];
+    fscanf(target_file,"%s %d\n%s %d\n%s ",ts[0],&type,ts[1],&ci,ts[2]);
+    fgets(resu,200,target_file);
+    resu[strlen(resu)-1]=0;
+    char update[300]={0};
+    sprintf(update,"UPDATE challenge set cha_result='%s' WHERE cha_id=%d",resu,ci);
+    mysql_query(mysql,update);
+    if (strcmp(resu,"Challenge Success")==0) {
+        char query[300]={0};
+        sprintf(query,"SELECT runid FROM challenge WHERE cha_id=%d",ci);
+        int temp_t=mysql_real_query(mysql,query,strlen(query));
+        MYSQL_RES *res=mysql_use_result(mysql);
+        MYSQL_ROW row=mysql_fetch_row(res);
+        int temp_runid=atoi(row[0]);
+        mysql_free_result(res);
+        sprintf(query,"Update status set result='Challenged' WHERE runid=%d",temp_runid);
+        mysql_query(mysql,query);
+    }
+
+    char tempcd[50000]={0};
+    char cd_info_data[MAX_DATA_SIZE]={0};
+    char cdupdate[MAX_DATA_SIZE]={0};
+    while (strcmp(tempcd,"__CHALLENGE-DETAIL-BEGIN-LABLE__")!=0&&strcmp(tempcd,"__CHALLENGE-DETAIL-BEGIN-LABLE__\n")!=0&&strcmp(tempcd,"__CHALLENGE-DETAIL-BEGIN-LABLE__\r\n")!=0) fgets(tempcd,50000,target_file);
+    while (1) {
+        fgets(tempcd,50000,target_file);
+        if (strcmp(tempcd,"__CHALLENGE-DETAIL-END-LABLE__")==0||strcmp(tempcd,"__CHALLENGE-DETAIL-END-LABLE__\n")==0||strcmp(tempcd,"__CHALLENGE-DETAIL-END-LABLE__\r\n")==0) break;
+        strcat(cd_info_data,tempcd);
+    }
+    std::string str1;
+    str1=cd_info_data;
+    int lastpos=0;
+
+    while (str1.find("\"",lastpos,1)!=std::string::npos) {
+        lastpos=str1.find("\"",lastpos,1);
+        str1.replace(lastpos,1,"\\\"");
+        lastpos+=2;
+    }
+    strcpy(cd_info_data,str1.c_str());
+    sprintf(cdupdate,"UPDATE challenge set cha_detail=\"%s\" WHERE cha_id=%d",cd_info_data,ci);
+    mysql_query(mysql,cdupdate);
+    char templog[2000]={0};
+    sprintf(templog,"Challenge result: cha_id: %d result: %s\n",ci,resu);
+    NOTICE(templog);
+    fclose(target_file);
+    mysql_close(mysql);
+    free(mysql);
+}
+
+bool dealdo_challenge(ARG * arg, task_t &task)
+{
+    MYSQL_RES *res;
+    MYSQL_ROW row;
+    MYSQL * mysql;
+    char buffer[MAX_DATA_SIZE]={0};
+    int tnum=arg->num;
+    int tfd=arg->fd;
+    char templog[20000]={0};
+
+    sprintf(templog,"Challenge fetched to no.%d",tnum);
+    NOTICE(templog);
+    mysql=(MYSQL *)malloc(sizeof(MYSQL));
+    mysql_init(mysql);
+    if (!mysql_real_connect(mysql,NULL,MYSQL_USER,MYSQL_PASSWORD,MYSQL_DB,MYSQL_PORT,NULL,0)) {
+    	FATAL("%s", mysql_error(mysql));
+        exit(1);
+    }
+    mysql_query(mysql,"set names utf8");
+    queuesize--;
+    char query[500]={0};
+    sprintf(query,"SELECT source,cha_id,language,pid,data_type,data_lang,data_detail FROM status,challenge WHERE status.runid=challenge.runid and cha_id=%d",task.get_runid());
+    //writelog(query);writelog("\n");
+    int temp_t=mysql_real_query(mysql,query,strlen(query));
+    if (temp_t) {
+    	FATAL("%s", mysql_error(mysql));
+        exit(1);
+    }
+    res=mysql_use_result(mysql);
+    row=mysql_fetch_row(res);
+    char filename[200]={0};
+    sprintf(filename,"cha_raw_files/%d.bott",task.get_runid());
+    NOTICE("FILENAME: %s", filename);
+    FILE* datafile=fopen(filename,"w");
+    if (datafile==NULL) {
+        char templog[200]={0};
+        sprintf(templog,"CANNOT OPEN FILE %s!!!",filename);
+        WARNING(templog);
+    }
+    fprintf(datafile,"<type> %d\n",task.get_runid());
+    fprintf(datafile,"__SOURCE-CODE-BEGIN-LABLE__\n");
+    fprintf(datafile,"%s\n",row[0]);
+    fprintf(datafile,"__SOURCE-CODE-END-LABLE__\n");
+    fprintf(datafile,"<cha_id> %s\n<language> %s\n<pid> %s\n<data_type> %s\n<data_lang> %s\n",row[1],row[2],row[3],row[4],row[5]);
+    fprintf(datafile,"__DATA-DETAIL-BEGIN-LABLE__\n");
+    fprintf(datafile,"%s\n",row[6]);
+    fprintf(datafile,"__DATA-DETAIL-END-LABLE__\n");
+    int temp_pid=atoi(row[3]);
+    mysql_free_result(res);
+    sprintf(query,"SELECT case_time_limit,memory_limit,special_judge_status FROM problem WHERE pid=%d",temp_pid);
+    temp_t=mysql_real_query(mysql,query,strlen(query));
+    if (temp_t) {
+    	FATAL("%s", mysql_error(mysql));
+        exit(1);
+    }
+    res=mysql_use_result(mysql);
+    row=mysql_fetch_row(res);
+    fprintf(datafile,"<time_limit> %s\n<case_limit> %s\n<memory_limit> %s\n<special> %s\n",row[0],row[0],row[1],row[2]);
+    mysql_free_result(res);
+    sprintf(query,"UPDATE challenge set cha_result='Testing' WHERE cha_id=%d",task.get_runid());
+    mysql_real_query(mysql,query,strlen(query));
+    fclose(datafile);
+    int source=open(filename,O_RDONLY);
+    while((temp_t=read(source,buffer,sizeof(buffer)))>0)
+        write(tfd,buffer,temp_t);
+    close(source);
+    sprintf(filename,"cha_results/%dres.bott",task.get_runid());
+    NOTICE("filename: %s", filename);
+    FILE *target_file=fopen(filename,"w");
+    bool got_things=false;
+    memset(buffer,0,sizeof(buffer));
+    while (!got_things)
+    {
+        while ((temp_t=recv(tfd,buffer,MAX_DATA_SIZE,MSG_DONTWAIT))>0)
+        {
+            got_things=true;
+            fputs(buffer,target_file);
+        }
+        if (temp_t==0) {
+            fclose(target_file);
+            char templog[200]={0};
+            sprintf(templog,"Lost connection with judger %d.",tnum);
+            WARNING(templog);
+            sprintf(templog,"Cha_id: %d requeued.",task.get_runid());
+            WARNING(templog);
+            sprintf(query,"UPDATE challenge set cha_result='Test Error & Requeued' WHERE cha_id=%d",task.get_runid());
+            mysql_real_query(mysql,query,strlen(query));
+//            temp=new Judger_data;
+//            task.get_runid()=dorunid[tnum].cha_id;
+//            temp->vname=dorunid[tnum].vname;
+//            temp->type=dorunid[tnum].type;
+//            temp->next=head;
+//            if (tail==NULL) tail=temp;
+//            head=temp;
+
+            pthread_mutex_lock(&task_queue::instance().task_list_lock);
+            task_queue::instance().push_back_task(task);
+            pthread_cond_signal(&task_queue::instance().task_cond_lock);
+            pthread_mutex_unlock(&task_queue::instance().task_list_lock);
+            mysql_close(mysql);
+            free(mysql);
+            return true;
+        }
+        usleep(5000);
+        if (buffer[0]!='<') got_things=false;
+    }
+    fclose(target_file);
+    int temp_chaid;
+    char temp1[50],temp2[50],temp3[50];
+    sscanf(buffer,"%s%s%s%d",temp1,temp2,temp3,&temp_chaid);
+    sprintf(filename,"cha_results/%dres.bott",temp_chaid);
+    target_file=fopen(filename,"w");
+    fputs(buffer,target_file);
+    while (recv(tfd,buffer,MAX_DATA_SIZE,MSG_DONTWAIT)>0)
+        fputs(buffer,target_file);
+    fclose(target_file);
+    cha_result_dealer(filename,task.get_runid());
+//    dorunid[tnum].cha_id=-1;
+    thread_busy[tnum]=false;
+    sprintf(templog,"%d Challenge Judge Finished",tnum);
+    NOTICE(templog);
+    mysql_close(mysql);
+    free(mysql);
+
+    return false;
+}
+
+void judger_thread(ARG* arg)
+{
+	task_t task;
+	char templog[200];
+    int tnum=arg->num;
+    int t=0;
+    while (used[tnum])
+    {
+        pthread_mutex_lock(&task_queue::instance().task_list_lock);
+        while (!task_queue::instance().get_task(task))
+        {
+        	pthread_cond_wait(&task_queue::instance().task_cond_lock, &task_queue::instance().task_list_lock);
+        }
+        pthread_mutex_unlock(&task_queue::instance().task_list_lock);
+
+		if (task.get_type()==DO_CHALLENGE)
+			sprintf(templog,"Fetched Challenge %d",task.get_cha_id());
+		else if (task.get_type()==NEED_JUDGE)
+			sprintf(templog,"Fetched RunID %d", task.get_runid());
+		else if (task.get_type()==DO_PRETEST)
+			sprintf(templog,"Fetched Pretest %d", task.get_runid());
+		NOTICE(templog);
+
+		if (task.get_type()==NEED_JUDGE || task.get_type()==DO_PRETEST || task.get_type()==DO_TESTALL)
+		{
+			dealneed_judge(arg, task);
+		}
+		else if (task.get_type()==DO_CHALLENGE)
+		{
+			dealdo_challenge(arg, task);
+		}
+		printf("Fetched RunID %d\n", task.get_runid());
+    }
+}
+
+void * function (void * arg)
+{
+	task_t task;
+    int fd=((ARG *)arg)->fd;
+    int tnum=((ARG *)arg)->num;
+    char buffer[255]={0};
+    thread_busy[tnum]=true;
+    struct timeval case_startv,case_nowv;
+    struct timezone case_startz,case_nowz;
+    gettimeofday(&case_startv,&case_startz);
+    int time_passed;
+    while (1)
+    {
+        usleep(1000);
+        gettimeofday(&case_nowv,&case_nowz);
+        time_passed=(case_nowv.tv_sec-case_startv.tv_sec)*1000+(case_nowv.tv_usec-case_startv.tv_usec)/1000;
+        if (recv(fd,buffer,255,MSG_DONTWAIT)>0||time_passed>5000) break;
+    }
+    char connect_type[50]={0};
+    sscanf(buffer,"%s",connect_type);
+    printf("current fd:%d\n",fd);
+    if (strcmp(connect_type,SUBMIT_STR)==0)
+    {
+        int runid;
+        char vname[100];
+        sscanf(buffer,"%s%d%s",connect_type,&runid,vname);
+        char templog[200]={0};
+        sprintf(templog,"received a submit, runid: %s:%d",vname, runid);
+        NOTICE(templog);
+//        Judger_data *temp;
+//        temp=new Judger_data;
+        task.set_runid(runid);
+        task.set_type(NEED_JUDGE);
+        task.set_vname(vname);
+
+        pthread_mutex_lock(&task_queue::instance().task_list_lock);
+        task_queue::instance().push_back_task(task);
+        pthread_cond_signal(&task_queue::instance().task_cond_lock);
+        pthread_mutex_unlock(&task_queue::instance().task_list_lock);
+    }
+    else if (strcmp(connect_type,PRETEST_STR)==0)
+    {
+        int runid;
+        char vname[100];
+        sscanf(buffer,"%s%d%s",connect_type,&runid,vname);
+        char templog[200]={0};
+        sprintf(templog,"received a pretest, runid: %s:%d", vname, runid);
+        NOTICE(templog);
+
+        task.set_runid(runid);
+        task.set_type(DO_PRETEST);
+        task.set_vname(vname);
+
+        pthread_mutex_lock(&task_queue::instance().task_list_lock);
+        task_queue::instance().push_back_task(task);
+        pthread_cond_signal(&task_queue::instance().task_cond_lock);
+        pthread_mutex_unlock(&task_queue::instance().task_list_lock);
+    }
+    else if (strcmp(connect_type,ERROR_REJUDGE_STR)==0)
+    {
+        int runid;
+        char vname[100];
+        sscanf(buffer,"%s%d%s",connect_type,&runid,vname);
+        char templog[200]={0};
+        sprintf(templog,"received a error rejudge, runid: %d",runid);
+        NOTICE(templog);
+
+        task.set_runid(runid);
+        task.set_type(NEED_JUDGE);
+        task.set_vname(vname);
+
+        pthread_mutex_lock(&task_queue::instance().task_list_lock);
+        task_queue::instance().push_back_task(task);
+        pthread_cond_signal(&task_queue::instance().task_cond_lock);
+        pthread_mutex_unlock(&task_queue::instance().task_list_lock);
+    }
+    else if (strcmp(connect_type,CHALLENGE_STR)==0) {
+        int cha_id;
+        char vname[100];
+        sscanf(buffer,"%s%d%s",connect_type,&cha_id,vname);
+        char templog[200]={0};
+        sprintf(templog,"received a challenge, cha_id: %s:%d", vname, cha_id);
+        NOTICE(templog);
+
+        task.set_cha_id(cha_id);
+        task.set_type(DO_CHALLENGE);
+        task.set_vname(vname);
+
+        pthread_mutex_lock(&task_queue::instance().task_list_lock);
+        task_queue::instance().push_back_task(task);
+        pthread_cond_signal(&task_queue::instance().task_cond_lock);
+        pthread_mutex_unlock(&task_queue::instance().task_list_lock);
+
+    }
+    else if (strcmp(connect_type,REJUDGE_CONN_STR)==0) {
+        char templog[200]={0};
+        char vname[100];
+        sscanf(buffer,"%s%s",connect_type,vname);
+        sprintf(templog,"judger %d : %s connected.",tnum,vname);
+        printf("judger %d : %s connected. \n",tnum,vname);
+        jvname[tnum]=vname;
+        NOTICE(templog);
+        thread_busy[tnum]=false;
+        if(used[tnum])
+           judger_thread((ARG*) arg);
+        sprintf(templog,"judger %d : %s finished.",tnum,vname);
+        NOTICE(templog);
+        jvname[tnum]="";
+    }
+    else if (strcmp(connect_type,REJUDGE_STR)==0) {
+        int repid,recid;
+        sscanf(buffer,"%s%d%d",connect_type,&repid,&recid);
+        MYSQL_RES *res;
+        MYSQL_ROW row;
+        MYSQL * mysql;
+        mysql=(MYSQL *)malloc(sizeof(MYSQL));
+        mysql_init(mysql);
+        if (!mysql_real_connect(mysql,NULL,MYSQL_USER,MYSQL_PASSWORD,MYSQL_DB,MYSQL_PORT,NULL,0)) {
+        	FATAL("%s", mysql_error(mysql));
+            exit(1);
+        }
+        mysql_query(mysql,"set names utf8");
+        char query[200]={0};
+        sprintf(query,"SELECT runid,vname FROM status,problem WHERE result='Rejudging' and contest_belong=%d and status.pid=%d and status.pid=problem.pid order by runid",recid,repid);
+//        writelog(query);
+        mysql_query(mysql,query);
+        res=mysql_use_result(mysql);
+        int rejudge_num=0;
+
+        pthread_mutex_lock(&task_queue::instance().task_list_lock);
+		while ((row=mysql_fetch_row(res)))
+		{
+			rejudge_num++;
+			task.set_runid(atoi(row[0]));
+			task.set_vname(row[1]);
+			task.set_type(NEED_JUDGE);
+
+			if(!task_queue::instance().has_task(task))
+			{
+				task_queue::instance().push_back_task(task);
+			}
+		}
+		pthread_cond_signal(&task_queue::instance().task_cond_lock);
+		pthread_mutex_unlock(&task_queue::instance().task_list_lock);
+        char templog[200]={0};
+        sprintf(templog,"received a rejudge request, pid: %d, cid: %d, num: %d",repid,recid,rejudge_num);
+        NOTICE(templog);
+        mysql_free_result(res);
+        mysql_close(mysql);
+        free(mysql);
+    }
+    else if (strcmp(connect_type,TEST_ALL_STR)==0) {
+        int recid;
+        sscanf(buffer,"%s%d",connect_type,&recid);
+        MYSQL_RES *res;
+        MYSQL_ROW row;
+        MYSQL * mysql;
+        mysql=(MYSQL *)malloc(sizeof(MYSQL));
+        mysql_init(mysql);
+        if (!mysql_real_connect(mysql,NULL,MYSQL_USER,MYSQL_PASSWORD,MYSQL_DB,MYSQL_PORT,NULL,0)) {
+        	FATAL("%s", mysql_error(mysql));
+            exit(1);
+        }
+        mysql_query(mysql,"set names utf8");
+        char query[200]={0};
+        sprintf(query,"SELECT runid,vname FROM status,problem WHERE result='Testing' and contest_belong=%d and status.pid=problem.pid order by runid",recid);
+        //writelog(query);
+        mysql_query(mysql,query);
+        res=mysql_use_result(mysql);
+        int rejudge_num=0;
+
+        pthread_mutex_lock(&task_queue::instance().task_list_lock);
+		while ((row=mysql_fetch_row(res)))
+		{
+			rejudge_num++;
+			task.set_runid(atoi(row[0]));
+			task.set_vname(row[1]);
+			task.set_type(DO_TESTALL);
+
+			if(!task_queue::instance().task_queue::instance().has_task(task))
+				task_queue::instance().push_back_task(task);
+		}
+		pthread_cond_signal(&task_queue::instance().task_cond_lock);
+		pthread_mutex_unlock(&task_queue::instance().task_list_lock);
+        char templog[200]={0};
+        sprintf(templog,"received a test all request, cid: %d, num: %d",recid,rejudge_num);
+        NOTICE(templog);
+        mysql_free_result(res);
+        mysql_close(mysql);
+        free(mysql);
+    }
+    else {
+        WARNING("Illegal connection! Server Recieved: %s.", buffer);
+    }
+    close(fd);
+    //printf("fd after close:%d\n",fd);
+    free(arg);
+    pthread_detach(pthread_self());
+    used[tnum]=false;
+    thread_busy[tnum]=false;
+    pthread_exit(NULL);
+}
+
+bool init()
+{
+	bool ret = true;
+
+	if(ret && !config::instance().load_conf("../conf", "ojserver.conf"))
+		ret = false;
+	if(ret && !my_log::instance().open_log())
+		ret = false;
+
+	config& conf = config::instance();
+	if(ret && !conf.get_string("MYSQL_HOST", MYSQL_HOST, sizeof(MYSQL_HOST)))
+	{
+		FATAL("config::get_string(MYSQL_HOST) failed!");
+		ret = false;
+	}
+
+	if(ret && !conf.get_string("MYSQL_USER", MYSQL_USER, sizeof(MYSQL_USER)))
+	{
+		FATAL("config::get_string(MYSQL_USER) failed!");
+		ret = false;
+	}
+
+	if(ret && !conf.get_string("MYSQL_PASSWORD", MYSQL_PASSWORD, sizeof(MYSQL_PASSWORD)))
+	{
+		FATAL("config::get_string(MYSQL_PASSWORD) failed!");
+		ret = false;
+	}
+
+	if(ret && !conf.get_string("MYSQL_DB", MYSQL_DB, sizeof(MYSQL_DB)))
+	{
+		FATAL("config::get_string(MYSQL_DB) failed!");
+		ret = false;
+	}
+
+	if(ret && !conf.get_int("MYSQL_PORT", MYSQL_port))
+	{
+		FATAL("config::get_int(MYSQL_PORT) failed!");
+		ret = false;
+	}
+
+	if(ret && !conf.get_int("LISTEN_PORT", LISTEN_PORT))
+	{
+		FATAL("config::get_int(LISTEN_PORT) failed!");
+		ret = false;
+	}
+
+	if(ret && !conf.get_string("REJUDGE_CONN_STR", REJUDGE_CONN_STR, sizeof(REJUDGE_CONN_STR)))
+	{
+		FATAL("config::get_string(REJUDGE_CONN_STR) failed!");
+		ret = false;
+	}
+
+	if(ret && !conf.get_string("SUBMIT_STR", SUBMIT_STR, sizeof(SUBMIT_STR)))
+	{
+		FATAL("config::get_string(SUBMIT_STR) failed!");
+		ret = false;
+	}
+
+	if(ret && !conf.get_string("REJUDGE_STR", REJUDGE_STR, sizeof(REJUDGE_STR)))
+	{
+		FATAL("config::get_string(REJUDGE_STR) failed!");
+		ret = false;
+	}
+
+	if(ret && !conf.get_string("ERROR_REJUDGE_STR", ERROR_REJUDGE_STR, sizeof(ERROR_REJUDGE_STR)))
+	{
+		FATAL("config::get_string(ERROR_REJUDGE_STR) failed!\n");
+		ret = false;
+	}
+
+	if(ret && !conf.get_string("CHALLENGE_STR", CHALLENGE_STR, sizeof(CHALLENGE_STR)))
+	{
+		FATAL("config::get_string(CHALLENGE_STR) failed!");
+		ret = false;
+	}
+	if(ret && !conf.get_string("PRETEST_STR", PRETEST_STR, sizeof(PRETEST_STR)))
+	{
+		FATAL("config::get_string(PRETEST_STR) failed!");
+		ret = false;
+	}
+
+	if(ret && !conf.get_string("TEST_ALL_STR", TEST_ALL_STR, sizeof(TEST_ALL_STR)))
+	{
+		FATAL("config::get_string(TEST_ALL_STR) failed!");
+		ret = false;
+	}
+	writeLog("[NOTICE] Server init success.");
+	if(ret)
+		NOTICE("Server init success.");
+	return ret;
+}
+
+void *scan_task(void* arg)
+{
+	char *str = (char *)arg;
+	if(str == NULL)
+		str = "";
+    MYSQL *mysql;
+    mysql=(MYSQL *)malloc(sizeof(MYSQL));
+    mysql_init(mysql);
+    if (!mysql_real_connect(mysql,NULL,MYSQL_USER,MYSQL_PASSWORD,MYSQL_DB,MYSQL_PORT,NULL,0)) {
+    	FATAL("%s", mysql_error(mysql));
+        exit(1);
+    }
+    mysql_query(mysql,"set names utf8");
+    while(1)
+    {
+    	int t = task_queue::instance().scan_task(mysql, str);
+    	if(t)
+    		NOTICE("Scan finish. Fetch %d new tasks.", t);
+    	sleep(1);
+    }
+//    mysql_free_result(res);
+    mysql_close(mysql);
+    free(mysql);
+}
+
+
+void *log_task(void* arg)
+{
+	int t;
+	while(1)
+	{
+		pthread_mutex_lock(&my_log::instance().log_list_lock);
+		t = my_log::instance().get_buffer_size();
+//		printf("buffer size: %d\n", t);
+		if(t==0)
+		{
+			pthread_mutex_unlock(&my_log::instance().log_list_lock);
+			sleep(my_log::instance().LOG_FLUSH_TIME);
+		}
+		else
+		{
+//			printf("enter log flush\n");
+			my_log::instance().log_flush();
+			pthread_mutex_unlock(&my_log::instance().log_list_lock);
+
+		}
+		sleep(my_log::instance().LOG_FLUSH_TIME);
+	}
+}
+
+int main(int argc, char * argv[])
+{
+    mkdir("raw_files",0777);
+    mkdir("results",0777);
+    mkdir("cha_raw_files",0777);
+    mkdir("cha_results",0777);
+    mkdir("../log",0777);
+    if(!init())
+    {
+    	writeLog("[ERROR] Server init failed.");
+    	return -1;
+    }
+    pthread_t tid;
+    ARG *arg;
+    int sockfd, client_fd;
+    struct sockaddr_in my_addr;
+    struct sockaddr_in remote_addr;
+    if ((sockfd = socket(AF_INET, SOCK_STREAM, 0)) == -1)
+    {
+    	FATAL("Socket Error: %s",strerror(errno));
+    	perror("Socket() error\n");
+        exit(1);
+    }
+    my_addr.sin_family = AF_INET;
+    my_addr.sin_port = htons(LISTEN_PORT);
+    my_addr.sin_addr.s_addr = INADDR_ANY;
+    bzero(&(my_addr.sin_zero),8);
+    if (bind(sockfd, (struct sockaddr *) &my_addr, sizeof (struct sockaddr)) == -1)
+    {
+    	FATAL("Bind Error: %s\n",strerror(errno));
+    	printf("Bind Error: %s\n",strerror(errno));
+        exit(1);
+    }
+
+    if (listen(sockfd, 10) == -1) {
+    	FATAL("Listen Error: %s",strerror(errno));
+        perror("Listen() error\n");
+        exit(1);
+    }
+    socklen_t sin_size = sizeof(struct sockaddr_in);
+
+    if(argc>1)
+    	pthread_create(&tid, NULL, scan_task, (void*)argv[1]);
+    else
+    	pthread_create(&tid, NULL, scan_task, NULL);
+    pthread_create(&tid, NULL, log_task, NULL);
+
+    while (1)
+    {
+        if ((client_fd = accept(sockfd, (struct sockaddr *) & remote_addr, &sin_size)) == -1)
+        {
+        	FATAL("Accept() error: %s", strerror(errno));
+            exit(1);
+        }
+        NOTICE("received a connection from %s:%d.", inet_ntoa(remote_addr.sin_addr), remote_addr.sin_port);
+        arg=new ARG;
+        arg->fd=client_fd;
+        for (temp_num=0;temp_num<MAX_JUDGER_NUMBER;temp_num++)
+        	if (!used[temp_num])
+        		break;
+        arg->num=temp_num;
+        used[temp_num]=true;
+        pthread_create(&tid,NULL,function,(void *)arg);
+        sleep(1);
+    }
+    close(sockfd);
+    exit(0);
+}
